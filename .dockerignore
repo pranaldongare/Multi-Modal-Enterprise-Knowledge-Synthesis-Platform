@@ -1,0 +1,17 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.env
+venv
+.venv
+.v
+v
+node_modules
+Frontend/node_modules
+data  
+.vite
+.kreuzberg
+data
+usr/
+**/usr/ 
