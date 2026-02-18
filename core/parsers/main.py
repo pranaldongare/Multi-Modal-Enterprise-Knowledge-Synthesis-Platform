@@ -18,7 +18,7 @@ from core.models.document import Document, Page
 from core.parsers.extensions import SUPPORTED_EXTENSIONS, IMAGE_EXTENSIONS
 from core.services.sqlite_manager import SQLiteManager
 from core.parsers.slide_export import convert_ppt_to_pptx, export_and_ocr_ppt_with_fallback, get_libreoffice_command
-from core.parsers.vlm import vlm_parse_slide
+from core.parsers.vlm import vlm_parse_slide, vlm_parse_batch
 from core.config import settings
 from pptx import Presentation
 from docx import Document as DocxDocument
@@ -733,6 +733,80 @@ async def extract_document(
         except Exception:
             traceback.print_exc()
 
+        # --- VLM batch enhancement for PPT slides ---
+        if settings.USE_VISION_MODEL and pages:
+            try:
+                print(f"[PPT] VLM enhancement enabled. Converting {safe_file_name} to PDF for rendering...")
+                await safe_emit(
+                    f"{user_id}/progress",
+                    {"message": f"Running VLM enhancement on {safe_file_name}..."},
+                )
+
+                # Convert PPTX to PDF via LibreOffice for page rendering
+                libreoffice_cmd = get_libreoffice_command()
+                pdf_path = None
+                if libreoffice_cmd:
+                    try:
+                        ppt_dir = os.path.dirname(file_path)
+                        proc = await asyncio.create_subprocess_exec(
+                            libreoffice_cmd, "--headless", "--convert-to", "pdf",
+                            "--outdir", ppt_dir, file_path,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        await asyncio.wait_for(proc.communicate(), timeout=120)
+                        if proc.returncode == 0:
+                            expected_pdf = os.path.splitext(file_path)[0] + ".pdf"
+                            if os.path.exists(expected_pdf):
+                                pdf_path = expected_pdf
+                    except Exception as e:
+                        print(f"[PPT] LibreOffice PDF conversion failed: {e}")
+                        traceback.print_exc()
+
+                if pdf_path:
+                    try:
+                        pdf_doc = fitz.open(pdf_path)
+                        slide_images = []
+                        slide_labels = []
+                        for pg_num in range(len(pdf_doc)):
+                            pg = pdf_doc.load_page(pg_num)
+                            pix = pg.get_pixmap(dpi=200)
+                            slide_images.append(pix.tobytes("png"))
+                            slide_labels.append(f"Slide {pg_num + 1}")
+                        pdf_doc.close()
+
+                        # Batch VLM processing
+                        vlm_results = await vlm_parse_batch(
+                            images=slide_images,
+                            page_labels=slide_labels,
+                            batch_size=10,
+                        )
+
+                        # Enhance: append VLM content to existing slide text
+                        for slide_idx, vlm_text in enumerate(vlm_results):
+                            if vlm_text and slide_idx < len(pages):
+                                enhancement = f"\n\n[VLM Enhanced Content]\n{vlm_text}\n[/VLM Enhanced Content]"
+                                pages[slide_idx].text += enhancement
+                                combined_texts[slide_idx] += enhancement
+                                print(f"[PPT] VLM enhancement added for slide {slide_idx + 1} ({len(vlm_text)} chars)")
+
+                    except Exception as e:
+                        print(f"[PPT] VLM batch processing failed: {e}")
+                        traceback.print_exc()
+                    finally:
+                        # Clean up temporary PDF
+                        try:
+                            if pdf_path and os.path.exists(pdf_path):
+                                os.remove(pdf_path)
+                        except Exception:
+                            pass
+                else:
+                    print("[PPT] Skipping VLM: LibreOffice not available for PDF conversion")
+
+            except Exception as e:
+                print(f"[PPT] VLM enhancement failed: {e}")
+                traceback.print_exc()
+
         await safe_emit(
             f"{user_id}/progress", {"message": f"Processing {title} successfully..."}
         )
@@ -875,6 +949,83 @@ async def extract_document(
                 if current_page.strip():
                     pages.append(Page(number=page_num, text=current_page.strip(), images=image_names_all))
 
+            # --- VLM batch enhancement for DOCX ---
+            if settings.USE_VISION_MODEL and pages:
+                try:
+                    print(f"[DOCX] VLM enhancement enabled. Converting {safe_file_name} to PDF for rendering...")
+                    await safe_emit(
+                        f"{user_id}/progress",
+                        {"message": f"Running VLM enhancement on {safe_file_name}..."},
+                    )
+
+                    libreoffice_cmd = get_libreoffice_command()
+                    pdf_path = None
+                    if libreoffice_cmd:
+                        try:
+                            docx_dir = os.path.dirname(file_path)
+                            proc = await asyncio.create_subprocess_exec(
+                                libreoffice_cmd, "--headless", "--convert-to", "pdf",
+                                "--outdir", docx_dir, file_path,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            await asyncio.wait_for(proc.communicate(), timeout=120)
+                            if proc.returncode == 0:
+                                expected_pdf = os.path.splitext(file_path)[0] + ".pdf"
+                                if os.path.exists(expected_pdf):
+                                    pdf_path = expected_pdf
+                        except Exception as e:
+                            print(f"[DOCX] LibreOffice PDF conversion failed: {e}")
+                            traceback.print_exc()
+
+                    if pdf_path:
+                        try:
+                            pdf_doc = fitz.open(pdf_path)
+                            doc_images = []
+                            doc_labels = []
+                            for pg_num in range(len(pdf_doc)):
+                                pg = pdf_doc.load_page(pg_num)
+                                pix = pg.get_pixmap(dpi=200)
+                                doc_images.append(pix.tobytes("png"))
+                                doc_labels.append(f"Page {pg_num + 1}")
+                            pdf_doc.close()
+
+                            vlm_results = await vlm_parse_batch(
+                                images=doc_images,
+                                page_labels=doc_labels,
+                                batch_size=10,
+                            )
+
+                            # Enhance: append VLM content to each page
+                            # DOCX pages don't map 1:1 to PDF pages, so enhance all pages
+                            # by joining all VLM results and appending
+                            vlm_combined = "\n\n".join(
+                                f"[VLM Page {i+1}]\n{text}" 
+                                for i, text in enumerate(vlm_results) if text
+                            )
+                            if vlm_combined:
+                                enhancement = f"\n\n[VLM Enhanced Content]\n{vlm_combined}\n[/VLM Enhanced Content]"
+                                # Append to the last page
+                                pages[-1].text += enhancement
+                                page_text += enhancement
+                                print(f"[DOCX] VLM enhancement added ({len(vlm_combined)} chars from {len(doc_images)} pages)")
+
+                        except Exception as e:
+                            print(f"[DOCX] VLM batch processing failed: {e}")
+                            traceback.print_exc()
+                        finally:
+                            try:
+                                if pdf_path and os.path.exists(pdf_path):
+                                    os.remove(pdf_path)
+                            except Exception:
+                                pass
+                    else:
+                        print("[DOCX] Skipping VLM: LibreOffice not available for PDF conversion")
+
+                except Exception as e:
+                    print(f"[DOCX] VLM enhancement failed: {e}")
+                    traceback.print_exc()
+
             await safe_emit(
                 f"{user_id}/progress",
                 {"message": f"Processed {safe_file_name} (Word) successfully"},
@@ -916,6 +1067,7 @@ async def extract_document(
         pages = []
         combined_texts = []
         ocr_tasks = {}
+        vlm_candidates = []  # Collect pages needing VLM for batch processing
 
         image_dir_base = f"data/{user_id}/threads/{thread_id}/images/{name}"
         MIN_IMAGE_SIZE = 50  # Skip images smaller than 50px (icons, bullets)
@@ -970,43 +1122,27 @@ async def extract_document(
                 else:
                     page_text = page.get_text("text")
 
-                # --- VLM Fallback for PPT-as-PDF or complex layouts ---
-                # Heuristic: If text is very sparse (< 50 chars) but page has content, 
-                # OR if explicitly enabled in settings.
+                # --- VLM candidate detection (Phase 1: collect, don't process yet) ---
                 use_vlm = settings.USE_VISION_MODEL
                 if not use_vlm:
-                    # Auto-detect "slide" characteristics: 
-                    # 1. Low text density
-                    # 2. Landscape orientation (width > height) often indicates slides
+                    # Auto-detect "slide" characteristics
                     is_landscape = page.rect.width > page.rect.height
                     if len(page_text.strip()) < 100 and is_landscape:
                         use_vlm = True
                 
                 if use_vlm:
                     try:
-                        print(f"[PDF] Triggering VLM for {safe_file_name} page {page_number + 1}...")
-                        # Render page to image
+                        # Render page to image and store for batch processing
                         pix = page.get_pixmap(dpi=200)
                         img_bytes = pix.tobytes("png")
-                        
-                        vlm_text = await vlm_parse_slide(img_bytes)
-                        # Force mode (USE_VLM_FOR_PDF=True): always prefer VLM if it returns content
-                        # Auto-detect mode: only use VLM if it extracted more than PyMuPDF
-                        should_use_vlm_result = False
-                        if vlm_text:
-                            if settings.USE_VISION_MODEL:
-                                should_use_vlm_result = True  # Force mode: always use VLM
-                            elif len(vlm_text) > len(page_text):
-                                should_use_vlm_result = True  # Auto-detect: use if VLM got more
-                        
-                        if should_use_vlm_result:
-                            page_text = f"[VLM Extracted Content]\n{vlm_text}\n[/VLM Extracted Content]"
-                            table_blocks = []  # VLM likely captured tables too
-                            print(f"[PDF] VLM content used for page {page_number + 1} ({len(vlm_text)} chars)")
-                        elif vlm_text:
-                            print(f"[PDF] VLM returned less content than PyMuPDF for page {page_number + 1}, keeping original")
+                        vlm_candidates.append({
+                            "page_index": page_number,  # 0-based index into pages[]
+                            "page_number": page_number + 1,  # 1-based for display
+                            "image_bytes": img_bytes,
+                            "original_text": page_text,
+                        })
                     except Exception as e:
-                        print(f"[PDF] VLM failed for page {page_number + 1}: {e}")
+                        print(f"[PDF] Failed to render page {page_number + 1} for VLM: {e}")
                         traceback.print_exc()
 
             except Exception:
@@ -1069,6 +1205,48 @@ async def extract_document(
             pages.append(
                 Page(number=page_number + 1, text=page_text, images=image_names)
             )
+
+        # --- Phase 2: Batch VLM processing for candidate pages ---
+        if vlm_candidates:
+            print(f"[PDF] {len(vlm_candidates)} pages queued for batch VLM processing")
+            await safe_emit(
+                f"{user_id}/progress",
+                {"message": f"Running VLM on {len(vlm_candidates)} pages of {safe_file_name}..."},
+            )
+
+            vlm_images = [c["image_bytes"] for c in vlm_candidates]
+            vlm_labels = [f"Page {c['page_number']}" for c in vlm_candidates]
+
+            vlm_results = await vlm_parse_batch(
+                images=vlm_images,
+                page_labels=vlm_labels,
+                batch_size=10,
+            )
+
+            # Merge VLM results back into pages
+            for candidate, vlm_text in zip(vlm_candidates, vlm_results):
+                if not vlm_text:
+                    continue
+
+                page_idx = candidate["page_index"]
+                original_text = candidate["original_text"]
+
+                # Force mode: always use VLM content
+                # Auto-detect mode: only use if VLM extracted more
+                should_use = False
+                if settings.USE_VISION_MODEL:
+                    should_use = True
+                elif len(vlm_text) > len(original_text):
+                    should_use = True
+
+                if should_use:
+                    enhanced_text = f"[VLM Extracted Content]\n{vlm_text}\n[/VLM Extracted Content]"
+                    # Update the page and combined text
+                    pages[page_idx].text = enhanced_text
+                    combined_texts[page_idx] = enhanced_text
+                    print(f"[PDF] VLM content used for page {candidate['page_number']} ({len(vlm_text)} chars)")
+                else:
+                    print(f"[PDF] VLM returned less content than PyMuPDF for page {candidate['page_number']}, keeping original")
 
         # Wait for OCR tasks from the embedded raster images only
         for placeholder, task in ocr_tasks.items():
